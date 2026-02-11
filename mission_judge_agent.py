@@ -1,164 +1,372 @@
 import os
 import json
 import base64
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import streamlit as st
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
-from langchain_core.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
 
 
-# =========================================================
-# 유틸
-# =========================================================
-def safe_json_load(s: str) -> Dict[str, Any]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return {"_raw": s}
+st.set_page_config(page_title="미션 인증 판정기", layout="centered")
+st.title("📸 미션 인증 확인")
+
+# ---------- session_state 초기화 ----------
+if "step" not in st.session_state:
+    st.session_state.step = 0  # 0=API, 1=미션입력, 2=미션확인, 3=사진추가, 4=사진요약, 5=최종판정
+
+if "api_key" not in st.session_state:
+    st.session_state.api_key = ""
+
+if "llm" not in st.session_state:
+    st.session_state.llm = None
+
+if "category" not in st.session_state:
+    st.session_state.category = "청소"
+
+if "details" not in st.session_state:
+    st.session_state.details = ""
+
+if "mission_obj" not in st.session_state:
+    st.session_state.mission_obj = None
+
+if "photo_paths" not in st.session_state:
+    st.session_state.photo_paths = []
+
+if "photo_obj" not in st.session_state:
+    st.session_state.photo_obj = None
+
+if "result_obj" not in st.session_state:
+    st.session_state.result_obj = None
 
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def save_json(path: str, obj: Any):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def image_to_data_url(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    mime = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(ext, "image/jpeg")
-
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
-
-
-# =========================================================
-# OpenAI LLM 빌더
-# =========================================================
-def build_llm(api_key: str, model_name: str = "gpt-4o-mini") -> ChatOpenAI:
-    os.environ["OPENAI_API_KEY"] = api_key
-    return ChatOpenAI(model=model_name, temperature=0)
-
-
-# =========================================================
-# 정책(고정)
-# =========================================================
-POLICY_TEXT = """
+# ---------- 공통: 정책 ----------
+policy = """
 - 청소: before/after 2장 권장 (정확히 2장이면 비교모드)
-- 숙제: 결과 사진만으로 평가 가능
+- 숙제: 결과 사진만으로 평가
 - 습관: 증거가 약하면 보수적 판정 + 부모 확인 권장
 - 통과 기준: 60%
 """.strip()
 
 
+# ---------- 공통: 사이드바(현재 입력 확인) ----------
+with st.sidebar:
+    st.subheader("현재 입력 상태")
+    st.write("STEP:", st.session_state.step)
+    st.write("카테고리:", st.session_state.category)
+    st.write("사진 수:", len(st.session_state.photo_paths))
+    if st.session_state.photo_paths:
+        st.caption("사진 목록")
+        for i, p in enumerate(st.session_state.photo_paths[:10], start=1):
+            st.caption(f"{i}. {p}")
+
+
 # =========================================================
-# LangChain Tools (@tool)
-# - 내부에서 st.session_state["llm"]를 사용해 호출
+# STEP 0) API 키 입력 + 검증
 # =========================================================
-@tool
-def missionGet(category: str, details: str, policy: str) -> str:
-    """
-    [1] 미션 요약/체크리스트 생성.
-    반환: JSON 문자열
-    """
-    llm: ChatOpenAI = st.session_state["llm"]
+if st.session_state.step == 0:
+    st.subheader("1) Gemini API Key 입력")
 
-    prompt = f"""
-너는 '미션 인증용 체크리스트/지침 생성기'다.
+    api_key = st.text_input("Gemini API Key", type="password", placeholder="AIzaSy...")
+    colA, colB = st.columns([1, 1])
 
-[카테고리]
-{category}
+    with colA:
+        if st.button("API 키 확인", type="primary"):
+            if not api_key.strip():
+                st.error("API 키를 입력하세요.")
+            else:
+                try:
+                    # build_llm은 기존에 정의된 함수 사용
+                    llm = build_llm(api_key)
 
-[부모 세부사항(원문)]
-{details}
+                    # 실제 호출로 키 검증 (가벼운 ping)
+                    llm.invoke("ping")
 
-[정책]
-{policy}
+                    st.session_state.api_key = api_key
+                    st.session_state.llm = llm
+                    st.success("API 키 확인 완료")
+                    st.session_state.step = 1
+                    st.rerun()
+                except Exception:
+                    st.error("API 키를 다시 확인해주세요.")
 
-규칙:
-- 사진으로 확인 가능한 기준만 작성(추상적 표현 금지)
-- checklist 3~10개
-- checklist의 각 항목에 evidence_hint 포함
-- 아래 스키마를 엄격히 지키고 JSON만 출력
+    with colB:
+        st.caption("API 키가 올바르지 않으면 다음 단계로 넘어가지 않습니다.")
 
-스키마:
-{{
-  "category": "{category}",
-  "details_raw": "{details}",
-  "mission_summary": "한 줄 요약",
-  "checklist": [
-    {{"item":"...", "evidence_hint":"..."}}
-  ],
-  "success_criteria": "완료 판정 기준 1~2문장"
-}}
-""".strip()
-
-    out = llm.invoke(prompt).content.strip()
-    obj = safe_json_load(out)
-
-    if isinstance(obj, dict):
-        obj.setdefault("category", category)
-        obj.setdefault("details_raw", details)
-        obj.setdefault("mission_summary", "")
-        obj.setdefault("checklist", [])
-        obj.setdefault("success_criteria", "")
-    return json.dumps(obj, ensure_ascii=False)
+    st.stop()
 
 
-@tool
-def photoGet(category: str, mission_summary_json: str, photo_paths: List[str]) -> str:
-    """
-    [2] 사진 분석(관찰 기반).
-    반환: JSON 문자열
-    """
-    llm: ChatOpenAI = st.session_state["llm"]
+# =========================================================
+# STEP 1) 미션 입력
+# =========================================================
+if st.session_state.step == 1:
+    st.subheader("2) 미션 입력")
 
-    if not photo_paths:
-        return json.dumps({"error": "photo_paths is empty"}, ensure_ascii=False)
+    category = st.selectbox("미션 카테고리", ["청소", "숙제", "심부름", "습관"], index=["청소", "숙제", "심부름", "습관"].index(st.session_state.category))
+    details = st.text_area("미션 세부사항 (부모 입력)", height=140, value=st.session_state.details)
 
-    # 최대 10장 제한
-    photo_paths = photo_paths[:10]
-    for p in photo_paths:
-        if not os.path.exists(p):
-            return json.dumps({"error": f"file not found: {p}"}, ensure_ascii=False)
+    col1, col2 = st.columns([1, 1])
 
-    mission_obj = safe_json_load(mission_summary_json)
-    mode = "before_after" if (category == "청소" and len(photo_paths) == 2) else "evidence_only"
+    with col1:
+        if st.button("미션 요약 생성", type="primary"):
+            if not details.strip():
+                st.error("미션 세부사항을 입력해주세요.")
+            else:
+                with st.spinner("미션 요약 생성 중..."):
+                    mission_obj = mission_get(st.session_state.llm, category, details, policy)
 
-    content = [{
-        "type": "text",
-        "text": f"""
-너는 '미션 증거 사진 분석기'다.
-추측하지 말고, 사진에서 관찰 가능한 사실만 작성해라.
+                st.session_state.category = category
+                st.session_state.details = details
+                st.session_state.mission_obj = mission_obj
 
-[모드] {mode}
+                # 저장 (JSON)
+                ensure_dir("outputs")
+                save_json("outputs/mission_summary.json", mission_obj)
 
-[미션 요약/체크리스트]
-{json.dumps({
-  "category": mission_obj.get("category"),
-  "mission_summary": mission_obj.get("mission_summary"),
-  "checklist": mission_obj.get("checklist", [])
-}, ensure_ascii=False)}
+                st.session_state.step = 2
+                st.rerun()
 
-출력(JSON만):
-{{
-  "mode": "{mode}",
-  "observations": ["관찰 요약 6~18개"],
-  "notable_changes": ["전후 변화 0~10개 (before_after일 때만 의미있게)"],
-  "caveats": ["한계/불확실 1~4개"]
+    with col2:
+        if st.button("초기화"):
+            st.session_state.category = "청소"
+            st.session_state.details = ""
+            st.session_state.mission_obj = None
+            st.session_state.photo_paths = []
+            st.session_state.photo_obj = None
+            st.session_state.result_obj = None
+            st.session_state.step = 1
+            st.rerun()
+
+    st.stop()
+
+
+# =========================================================
+# STEP 2) 미션 요약 확인 + 확인 버튼
+# =========================================================
+if st.session_state.step == 2:
+    st.subheader("[1] 미션 요약 (확인 후 다음 단계로 이동)")
+
+    mission_obj = st.session_state.mission_obj or {}
+    st.write("카테고리:", mission_obj.get("category", st.session_state.category))
+
+    st.write("체크리스트(입력한 세부사항에서 추출):")
+    checklist = mission_obj.get("checklist", [])
+    if checklist:
+        for c in checklist:
+            st.write("- " + str(c.get("item", "")))
+    else:
+        st.warning("체크리스트가 비어 있어요. 미션 세부사항을 더 구체적으로 적어보는 게 좋아요.")
+
+    st.write("입력한 세부사항 전체:")
+    st.info(st.session_state.details)
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        if st.button("이 내용으로 진행", type="primary"):
+            st.session_state.step = 3
+            st.rerun()
+
+    with col2:
+        if st.button("미션 다시 수정"):
+            st.session_state.step = 1
+            st.rerun()
+
+    st.stop()
+
+
+# =========================================================
+# STEP 3) 사진 경로 1개씩 추가 + 목록 확인 + 확인 버튼
+# =========================================================
+if st.session_state.step == 3:
+    st.subheader("3) 사진 경로 추가")
+
+    st.caption("사진은 한 번에 1개씩 추가하세요. 최대 10장까지 사용합니다.")
+    if st.session_state.category == "청소":
+        st.caption("청소는 before/after 2장을 권장합니다. (정확히 2장이면 전후 비교 모드)")
+
+    new_path = st.text_input("사진 경로", placeholder="/Users/.../before.jpg")
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+
+    with col1:
+        if st.button("사진 추가"):
+            if not new_path.strip():
+                st.error("경로를 입력해주세요.")
+            else:
+                if len(st.session_state.photo_paths) >= 10:
+                    st.error("최대 10장까지만 추가할 수 있어요.")
+                else:
+                    # 파일 존재 확인(가능한 경우)
+                    if not os.path.exists(new_path):
+                        st.error("해당 경로에 파일이 없습니다. 경로를 다시 확인해주세요.")
+                    else:
+                        st.session_state.photo_paths.append(new_path.strip())
+                        st.success("추가 완료")
+                        st.rerun()
+
+    with col2:
+        if st.button("마지막 사진 삭제"):
+            if st.session_state.photo_paths:
+                st.session_state.photo_paths.pop()
+                st.rerun()
+
+    with col3:
+        if st.button("사진 전체 초기화"):
+            st.session_state.photo_paths = []
+            st.rerun()
+
+    st.markdown("### 현재 추가된 사진")
+    if not st.session_state.photo_paths:
+        st.warning("아직 사진이 없습니다.")
+    else:
+        for i, p in enumerate(st.session_state.photo_paths, start=1):
+            st.write(f"{i}. {p}")
+
+    if st.button("사진 분석 진행", type="primary"):
+        if len(st.session_state.photo_paths) == 0:
+            st.error("사진을 최소 1장 추가해주세요.")
+        else:
+            st.session_state.step = 4
+            st.rerun()
+
+    st.stop()
+
+
+# =========================================================
+# STEP 4) 사진 분석 요약 (작은 글씨) + 확인 버튼
+# =========================================================
+if st.session_state.step == 4:
+    st.subheader("[2] 사진 분석 (확인 후 최종 판정)")
+
+    with st.spinner("사진 분석 중..."):
+        photo_obj = photo_get(
+            st.session_state.llm,
+            st.session_state.category,
+            st.session_state.mission_obj,
+            st.session_state.photo_paths
+        )
+        st.session_state.photo_obj = photo_obj
+
+        # 저장 (JSON)
+        ensure_dir("outputs")
+        save_json("outputs/photo_analysis.json", photo_obj)
+
+    # 작은 글씨 출력
+    observations = photo_obj.get("observations", [])
+    notable_changes = photo_obj.get("notable_changes", [])
+    caveats = photo_obj.get("caveats", [])
+
+    st.markdown("관찰 요약")
+    if observations:
+        st.markdown(
+            "<div style='font-size:12px; line-height:1.5; color:#444;'>"
+            + "<br>".join([f"- {st.escape_markdown(str(x))}" for x in observations])
+            + "</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.caption("관찰 요약이 비어 있어요.")
+
+    st.markdown("전후 변화")
+    if notable_changes:
+        st.markdown(
+            "<div style='font-size:12px; line-height:1.5; color:#444;'>"
+            + "<br>".join([f"- {st.escape_markdown(str(x))}" for x in notable_changes])
+            + "</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.caption("전후 변화 항목이 없어요. (청소+2장 조건이 아니거나 변화가 불명확할 수 있어요.)")
+
+    st.markdown("한계")
+    if caveats:
+        st.markdown(
+            "<div style='font-size:12px; line-height:1.5; color:#666;'>"
+            + "<br>".join([f"- {st.escape_markdown(str(x))}" for x in caveats])
+            + "</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.caption("한계 항목이 없어요.")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("최종 판정 보기", type="primary"):
+            st.session_state.step = 5
+            st.rerun()
+    with col2:
+        if st.button("사진 다시 추가/수정"):
+            st.session_state.step = 3
+            st.rerun()
+
+    st.stop()
+
+
+# =========================================================
+# STEP 5) 최종 판정 (한 섹션 / 아이콘 / 색)
+# =========================================================
+if st.session_state.step == 5:
+    st.subheader("[3] 최종 판정")
+
+    with st.spinner("최종 판정 중..."):
+        result_obj = mission_complete(
+            st.session_state.llm,
+            st.session_state.mission_obj,
+            st.session_state.photo_obj
+        )
+        st.session_state.result_obj = result_obj
+
+        # 저장 (JSON)
+        ensure_dir("outputs")
+        save_json("outputs/final_grade.json", result_obj)
+
+    passed = bool(result_obj.get("pass", False))
+    percent = result_obj.get("completion_percent", 0)
+
+    # 한 섹션 구성
+    if passed:
+        st.success(f"🟢 통과 ({percent}%)")
+    else:
+        st.error(f"🔴 반려 ({percent}%)")
+
+    st.markdown("근거")
+    for r in result_obj.get("reason_summary", [])[:6]:
+        st.write("- " + str(r))
+
+    if not passed:
+        st.markdown("반려 사유 / 추가 요청")
+        missing = result_obj.get("missing_or_unclear", [])
+        if missing:
+            for m in missing[:6]:
+                st.write("- " + str(m))
+
+        req = result_obj.get("next_request_to_child", [])
+        if req:
+            st.markdown("추가로 요청할 증거")
+            for x in req[:6]:
+                st.write("- " + str(x))
+
+    st.success("판정 완료 및 JSON 저장 완료 (outputs/mission_summary.json, outputs/photo_analysis.json, outputs/final_grade.json)")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("처음부터 다시"):
+            st.session_state.step = 0
+            st.session_state.api_key = ""
+            st.session_state.llm = None
+            st.session_state.category = "청소"
+            st.session_state.details = ""
+            st.session_state.mission_obj = None
+            st.session_state.photo_paths = []
+            st.session_state.photo_obj = None
+            st.session_state.result_obj = None
+            st.rerun()
+
+    with col2:
+        if st.button("사진 단계로 돌아가기"):
+            st.session_state.step = 3
+            st.rerun()
 }}
 
 주의:
